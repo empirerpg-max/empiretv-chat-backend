@@ -131,10 +131,18 @@ wss.on("connection", (ws, req) => {
         room.messages = room.messages.slice(room.messages.length - 2000);
       }
 
-      // broadcast para todos na sala
+      // FIX: broadcast para todos na sala EXCETO o remetente.
+      // O remetente já inseriu uma mensagem otimista localmente (prefixo tmp-).
+      // Incluí-lo no broadcast causaria duplicata no frontend.
       room.clients.forEach((client) => {
-        wsSend(client, { type: "message", message: chatMsg });
+        if (client !== ws) {
+          wsSend(client, { type: "message", message: chatMsg });
+        }
       });
+
+      // Confirma para o remetente com o id real gerado pelo servidor,
+      // permitindo que o frontend troque a mensagem otimista pela definitiva.
+      wsSend(ws, { type: "message_ack", message: chatMsg });
 
       return;
     }
