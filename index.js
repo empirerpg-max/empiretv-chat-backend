@@ -6,156 +6,208 @@ const WebSocket = require("ws");
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// permitir chamadas do seu app (ajuste origin se quiser travar)
 app.use(cors());
 app.use(express.json());
 
-// --- Estrutura em memória -------------------------------------------------
-
+// ─── Memória ──────────────────────────────────────────────────────────────────
 // rooms[roomId] = { messages: ChatMsg[], clients: Set<WebSocket> }
 const rooms = {};
 
-// gera id simples de mensagem
+function getRoom(roomId) {
+  if (!rooms[roomId]) rooms[roomId] = { messages: [], clients: new Set() };
+  return rooms[roomId];
+}
+
 function genId() {
   return "m_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2);
 }
 
-// --- HTTP para healthcheck e histórico ------------------------------------
+function wsSend(ws, obj) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
 
-app.get("/ping", (req, res) => {
-  res.json({ ok: true, message: "empiretv-chat-backend online" });
+function broadcast(room, payload, excludeWs) {
+  room.clients.forEach((client) => {
+    if (client !== excludeWs) wsSend(client, payload);
+  });
+}
+
+function pushMessage(roomId, chatMsg) {
+  const room = getRoom(roomId);
+  room.messages.push(chatMsg);
+  if (room.messages.length > 2000)
+    room.messages = room.messages.slice(room.messages.length - 2000);
+  return room;
+}
+
+// ─── HTTP endpoints ───────────────────────────────────────────────────────────
+
+/** Healthcheck / warmup — chamado pelo frontend antes de abrir WS */
+app.get("/ping", (_req, res) => {
+  res.json({ ok: true, ts: Date.now() });
 });
 
-// pega histórico de uma sala (para fallback ou debug)
-app.get("/history/:roomId", (req, res) => {
-  const roomId = String(req.params.roomId || "");
+/**
+ * GET /messages/:roomId?since=<iso>&limit=<n>
+ * Polling HTTP puro — base garantida mesmo sem WebSocket.
+ * O frontend usa isso como fallback (e como fonte primária enquanto o WS não conecta).
+ */
+app.get("/messages/:roomId", (req, res) => {
+  const roomId = String(req.params.roomId || "").trim();
+  if (!roomId) return res.status(400).json({ ok: false, error: "roomId obrigatório" });
+  const room = getRoom(roomId);
+  const since = req.query.since ? new Date(req.query.since).getTime() : 0;
+  const limit = Math.min(parseInt(req.query.limit) || 60, 200);
+  let msgs = since > 0
+    ? room.messages.filter((m) => new Date(m.data).getTime() > since)
+    : room.messages.slice(-limit);
+  res.json({ ok: true, messages: msgs, ts: new Date().toISOString() });
+});
+
+/**
+ * POST /send
+ * Envia mensagem via HTTP — fallback garantido quando WS não está disponível.
+ * Body: { roomId, userId, nome, texto, tipo?, gifUrl? }
+ */
+app.post("/send", (req, res) => {
+  const { roomId, userId, nome, texto, tipo, gifUrl } = req.body || {};
+  if (!roomId || !userId || (!texto && !gifUrl))
+    return res.status(400).json({ ok: false, error: "dados incompletos" });
+
+  const chatMsg = {
+    id: genId(),
+    tgId: String(userId),
+    nome: String(nome || "Anon"),
+    texto: String(texto || ""),
+    tipo: tipo || "texto",
+    gifUrl: gifUrl || "",
+    data: new Date().toISOString(),
+  };
+
+  const room = pushMessage(String(roomId), chatMsg);
+  // broadcast para clientes WS da sala
+  broadcast(room, { type: "message", message: chatMsg });
+  res.json({ ok: true, message: chatMsg });
+});
+
+/**
+ * POST /participacao
+ * Registra ou incrementa participação de um usuário.
+ * Body: { roomId, userId, nome, programa, tipo? }
+ * Retorna ranking completo da sala.
+ */
+app.post("/participacao", (req, res) => {
+  const { roomId, userId, nome, programa, tipo } = req.body || {};
+  if (!roomId || !userId || !programa)
+    return res.status(400).json({ ok: false, error: "dados incompletos" });
+
+  const room = getRoom(String(roomId));
+  if (!room.participacao) room.participacao = {};
+
+  const key = String(userId);
+  if (!room.participacao[key]) {
+    room.participacao[key] = { tgId: key, nome: String(nome || "Anon"), programa: String(programa), tipo: tipo || "", mensagens: 0 };
+  }
+  room.participacao[key].mensagens += 1;
+  room.participacao[key].nome = String(nome || room.participacao[key].nome);
+
+  // recalcula porcentagens
+  const items = Object.values(room.participacao);
+  const total = items.reduce((s, i) => s + i.mensagens, 0);
+  items.forEach((i) => { i.porcentagem = total > 0 ? Math.round((i.mensagens / total) * 100) + "%" : "0%"; });
+
+  const ranking = items.sort((a, b) => b.mensagens - a.mensagens);
+  res.json({ ok: true, ranking });
+});
+
+/**
+ * GET /participacao/:roomId
+ * Retorna ranking atual da sala.
+ */
+app.get("/participacao/:roomId", (req, res) => {
+  const roomId = String(req.params.roomId || "").trim();
   const room = rooms[roomId];
-  res.json(room ? room.messages : []);
+  if (!room || !room.participacao) return res.json({ ok: true, ranking: [] });
+  const items = Object.values(room.participacao).sort((a, b) => b.mensagens - a.mensagens);
+  res.json({ ok: true, ranking: items });
 });
 
-// exporta e opcionalmente limpa sala (para Apps Script usar no fim do programa)
+/**
+ * GET /export/:roomId?clear=true
+ * Exporta histórico (Apps Script chama no fim da transmissão).
+ */
 app.get("/export/:roomId", (req, res) => {
   const roomId = String(req.params.roomId || "");
   const room = rooms[roomId];
   const messages = room ? room.messages : [];
-  const clear = String(req.query.clear || "false") === "true";
-  if (clear) {
-    delete rooms[roomId];
-  }
-  res.json({ roomId, messages, cleared: clear });
+  const participacao = room ? (room.participacao ? Object.values(room.participacao) : []) : [];
+  if (String(req.query.clear) === "true") delete rooms[roomId];
+  res.json({ roomId, messages, participacao, cleared: String(req.query.clear) === "true" });
 });
 
-// --- Servidor HTTP + WebSocket --------------------------------------------
-
+// ─── WebSocket (opcional — melhora a experiência mas não é obrigatório) ───────
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// helper: envia JSON pelo socket
-function wsSend(ws, obj) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(obj));
-  }
-}
-
-// quando um cliente conecta
-wss.on("connection", (ws, req) => {
-  // vamos receber os dados de identificação na primeira mensagem
+wss.on("connection", (ws) => {
   ws.on("message", (data) => {
     let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(data.toString()); } catch { return; }
 
-    // handshake inicial: { type: "join", roomId, userId, nome }
     if (msg.type === "join") {
       const roomId = String(msg.roomId || "").trim();
       const userId = String(msg.userId || "").trim();
-      const nome = String(msg.nome || "Anon").trim();
+      const nome   = String(msg.nome   || "Anon").trim();
+      if (!roomId || !userId) return wsSend(ws, { type: "error", message: "roomId e userId obrigatórios" });
 
-      if (!roomId || !userId) {
-        wsSend(ws, { type: "error", message: "roomId e userId obrigatórios" });
-        return;
-      }
-
-      if (!rooms[roomId]) {
-        rooms[roomId] = { messages: [], clients: new Set() };
-      }
+      const room = getRoom(roomId);
       ws.roomId = roomId;
       ws.userId = userId;
-      ws.nome = nome;
-      rooms[roomId].clients.add(ws);
+      ws.nome   = nome;
+      room.clients.add(ws);
 
-      // manda histórico recente (limitar a, por exemplo, 200 últimas)
-      const history = rooms[roomId].messages;
-      const recent =
-        history.length > 200 ? history.slice(history.length - 200) : history;
+      const history = room.messages;
+      const recent = history.length > 200 ? history.slice(-200) : history;
       wsSend(ws, { type: "history", messages: recent });
-
       return;
     }
 
-    // enviar nova mensagem: { type: "message", roomId, userId, nome, texto, tipo, gifUrl }
     if (msg.type === "message") {
       const roomId = String(msg.roomId || ws.roomId || "").trim();
       const userId = String(msg.userId || ws.userId || "").trim();
-      const nome = String(msg.nome || ws.nome || "Anon").trim();
-      const texto = String(msg.texto || "").trim();
-      const tipo = msg.tipo || "texto";
+      const nome   = String(msg.nome   || ws.nome   || "Anon").trim();
+      const texto  = String(msg.texto  || "").trim();
       const gifUrl = msg.gifUrl || "";
-
-      if (!roomId || !userId || (!texto && !gifUrl)) {
-        wsSend(ws, { type: "error", message: "dados incompletos" });
-        return;
-      }
-
-      if (!rooms[roomId]) {
-        rooms[roomId] = { messages: [], clients: new Set() };
-      }
+      if (!roomId || !userId || (!texto && !gifUrl))
+        return wsSend(ws, { type: "error", message: "dados incompletos" });
 
       const chatMsg = {
-        id: genId(),
-        tgId: userId,
-        nome,
-        texto,
-        tipo,
-        gifUrl,
+        id: genId(), tgId: userId, nome,
+        texto, tipo: msg.tipo || "texto", gifUrl,
         data: new Date().toISOString(),
       };
 
-      // guarda em memória (até ~2000 por sala)
-      const room = rooms[roomId];
-      room.messages.push(chatMsg);
-      if (room.messages.length > 2000) {
-        room.messages = room.messages.slice(room.messages.length - 2000);
-      }
+      const room = pushMessage(roomId, chatMsg);
 
-      // FIX: broadcast para todos na sala EXCETO o remetente.
-      // O remetente já inseriu uma mensagem otimista localmente (prefixo tmp-).
-      // Incluí-lo no broadcast causaria duplicata no frontend.
-      room.clients.forEach((client) => {
-        if (client !== ws) {
-          wsSend(client, { type: "message", message: chatMsg });
-        }
-      });
+      // registra participação automaticamente
+      if (!room.participacao) room.participacao = {};
+      if (!room.participacao[userId]) room.participacao[userId] = { tgId: userId, nome, programa: roomId, tipo: "", mensagens: 0 };
+      room.participacao[userId].mensagens += 1;
+      const items = Object.values(room.participacao);
+      const total = items.reduce((s, i) => s + i.mensagens, 0);
+      items.forEach((i) => { i.porcentagem = Math.round((i.mensagens / total) * 100) + "%"; });
 
-      // Confirma para o remetente com o id real gerado pelo servidor,
-      // permitindo que o frontend troque a mensagem otimista pela definitiva.
+      // broadcast para OUTROS clientes WS
+      broadcast(room, { type: "message", message: chatMsg }, ws);
+      // ACK para o remetente com id real
       wsSend(ws, { type: "message_ack", message: chatMsg });
-
       return;
     }
   });
 
   ws.on("close", () => {
-    const roomId = ws.roomId;
-    if (roomId && rooms[roomId]) {
-      rooms[roomId].clients.delete(ws);
-    }
+    if (ws.roomId && rooms[ws.roomId]) rooms[ws.roomId].clients.delete(ws);
   });
 });
 
-server.listen(PORT, () => {
-  console.log("Chat backend rodando na porta", PORT);
-});
+server.listen(PORT, () => console.log("Chat backend rodando na porta", PORT));
