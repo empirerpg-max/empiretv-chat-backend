@@ -1,213 +1,259 @@
-const express = require("express");
-const cors = require("cors");
-const http = require("http");
+// ============================================================
+// EMPIRE TV — Chat Backend v3
+// WebSocket-first (zero delay) + HTTP fallback
+// Arquivo: salvo via POST /room/close → Apps Script grava na planilha
+// ============================================================
+const express   = require("express");
+const cors      = require("cors");
+const http      = require("http");
 const WebSocket = require("ws");
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 10000;
 
-app.use(cors());
-app.use(express.json());
+// URL do Apps Script para persistência — sete via variável de ambiente
+const GAS_ARCHIVE_URL = process.env.GAS_ARCHIVE_URL || "";
+
+app.use(cors({ origin: "*" }));
+app.use(express.json({ limit: "2mb" }));
 
 // ─── Memória ──────────────────────────────────────────────────────────────────
-// rooms[roomId] = { messages: ChatMsg[], clients: Set<WebSocket> }
-const rooms = {};
+// rooms[roomId] = { messages[], clients Set, participacao{}, meta{} }
+// archive[roomId] = snapshot (em RAM até restart; persistência real fica na planilha)
+const rooms   = {};
+const archive = {};
 
-function getRoom(roomId) {
-  if (!rooms[roomId]) rooms[roomId] = { messages: [], clients: new Set() };
-  return rooms[roomId];
+function getRoom(id) {
+  if (!rooms[id]) rooms[id] = { messages: [], clients: new Set(), participacao: {}, meta: {} };
+  return rooms[id];
 }
-
 function genId() {
-  return "m_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2);
+  return "m_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
 }
-
 function wsSend(ws, obj) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
-
-function broadcast(room, payload, excludeWs) {
-  room.clients.forEach((client) => {
-    if (client !== excludeWs) wsSend(client, payload);
-  });
+function broadcastRoom(room, payload, exclude) {
+  room.clients.forEach(c => { if (c !== exclude) wsSend(c, payload); });
+}
+function pushMsg(roomId, msg) {
+  const r = getRoom(roomId);
+  r.messages.push(msg);
+  if (r.messages.length > 5000) r.messages = r.messages.slice(-5000);
+  return r;
+}
+function addParticipacao(room, userId, nome, roomId) {
+  if (!room.participacao[userId])
+    room.participacao[userId] = { tgId: userId, nome, programa: roomId, mensagens: 0 };
+  room.participacao[userId].mensagens++;
+  room.participacao[userId].nome = nome;
+  const items = Object.values(room.participacao);
+  const total = items.reduce((s, i) => s + i.mensagens, 0);
+  items.forEach(i => { i.porcentagem = total ? Math.round(i.mensagens / total * 100) + "%" : "0%"; });
+}
+function ranking(room) {
+  return Object.values(room.participacao || {}).sort((a, b) => b.mensagens - a.mensagens);
+}
+function broadcastOnline(room) {
+  const count = room.clients.size;
+  room.clients.forEach(c => wsSend(c, { type: "online", count }));
 }
 
-function pushMessage(roomId, chatMsg) {
-  const room = getRoom(roomId);
-  room.messages.push(chatMsg);
-  if (room.messages.length > 2000)
-    room.messages = room.messages.slice(room.messages.length - 2000);
-  return room;
-}
+// ─── Healthcheck ─────────────────────────────────────────────────────────────
+app.get("/ping", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// ─── HTTP endpoints ───────────────────────────────────────────────────────────
-
-/** Healthcheck / warmup — chamado pelo frontend antes de abrir WS */
-app.get("/ping", (_req, res) => {
-  res.json({ ok: true, ts: Date.now() });
+// ─── Online count ─────────────────────────────────────────────────────────────
+app.get("/online/:roomId", (req, res) => {
+  const r = rooms[req.params.roomId];
+  res.json({ ok: true, count: r ? r.clients.size : 0 });
 });
 
-/**
- * GET /messages/:roomId?since=<iso>&limit=<n>
- * Polling HTTP puro — base garantida mesmo sem WebSocket.
- * O frontend usa isso como fallback (e como fonte primária enquanto o WS não conecta).
- */
+// ─── Mensagens (HTTP fallback) ────────────────────────────────────────────────
 app.get("/messages/:roomId", (req, res) => {
-  const roomId = String(req.params.roomId || "").trim();
-  if (!roomId) return res.status(400).json({ ok: false, error: "roomId obrigatório" });
-  const room = getRoom(roomId);
-  const since = req.query.since ? new Date(req.query.since).getTime() : 0;
-  const limit = Math.min(parseInt(req.query.limit) || 60, 200);
-  let msgs = since > 0
-    ? room.messages.filter((m) => new Date(m.data).getTime() > since)
-    : room.messages.slice(-limit);
-  res.json({ ok: true, messages: msgs, ts: new Date().toISOString() });
+  const id = String(req.params.roomId || "").trim();
+  if (!id) return res.status(400).json({ ok: false, error: "roomId obrigatório" });
+  if (archive[id]) {
+    const ar = archive[id];
+    return res.json({ ok: true, archived: true, messages: ar.messages.slice(-200),
+      meta: ar.meta, ranking: ranking(ar), closedAt: ar.closedAt });
+  }
+  const room  = getRoom(id);
+  const since = req.query.since ? +new Date(req.query.since) : 0;
+  const msgs  = since > 0
+    ? room.messages.filter(m => +new Date(m.data) > since)
+    : room.messages.slice(-100);
+  res.json({ ok: true, archived: false, messages: msgs, onlineCount: room.clients.size, ts: new Date().toISOString() });
 });
 
-/**
- * POST /send
- * Envia mensagem via HTTP — fallback garantido quando WS não está disponível.
- * Body: { roomId, userId, nome, texto, tipo?, gifUrl? }
- */
+// ─── Enviar mensagem (HTTP fallback) ─────────────────────────────────────────
 app.post("/send", (req, res) => {
   const { roomId, userId, nome, texto, tipo, gifUrl } = req.body || {};
   if (!roomId || !userId || (!texto && !gifUrl))
     return res.status(400).json({ ok: false, error: "dados incompletos" });
+  if (archive[roomId])
+    return res.status(403).json({ ok: false, error: "Transmissão encerrada." });
+  const msg = { id: genId(), tgId: String(userId), nome: String(nome || "Anon"),
+    texto: String(texto || ""), tipo: tipo || "texto", gifUrl: gifUrl || "",
+    data: new Date().toISOString() };
+  const room = pushMsg(String(roomId), msg);
+  addParticipacao(room, String(userId), String(nome || "Anon"), String(roomId));
+  broadcastRoom(room, { type: "message", message: msg });
+  broadcastOnline(room);
+  res.json({ ok: true, message: msg });
+});
 
-  const chatMsg = {
-    id: genId(),
-    tgId: String(userId),
-    nome: String(nome || "Anon"),
-    texto: String(texto || ""),
-    tipo: tipo || "texto",
-    gifUrl: gifUrl || "",
-    data: new Date().toISOString(),
+// ─── Metadados da sala ────────────────────────────────────────────────────────
+app.post("/room/meta", (req, res) => {
+  const { roomId, programa, tipo, data, horario, capaUrl } = req.body || {};
+  if (!roomId) return res.status(400).json({ ok: false, error: "roomId obrigatório" });
+  const r = getRoom(String(roomId));
+  r.meta = { programa: programa || "", tipo: tipo || "", data: data || "", horario: horario || "", capaUrl: capaUrl || "" };
+  res.json({ ok: true });
+});
+
+// ─── Encerrar transmissão → arquivar + notificar GAS ─────────────────────────
+app.post("/room/close", async (req, res) => {
+  const { roomId, secret } = req.body || {};
+  if (!roomId) return res.status(400).json({ ok: false, error: "roomId obrigatório" });
+  if (process.env.WORKER_SECRET && secret !== process.env.WORKER_SECRET)
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+
+  const room = rooms[String(roomId)];
+  if (!room) return res.json({ ok: true, message: "sala já inexistente" });
+
+  const snapshot = {
+    messages:     [...room.messages],
+    participacao: { ...room.participacao },
+    meta:         room.meta || {},
+    closedAt:     new Date().toISOString(),
   };
+  archive[String(roomId)] = snapshot;
 
-  const room = pushMessage(String(roomId), chatMsg);
-  // broadcast para clientes WS da sala
-  broadcast(room, { type: "message", message: chatMsg });
-  res.json({ ok: true, message: chatMsg });
-});
+  // Notifica clientes WS
+  room.clients.forEach(c => {
+    wsSend(c, { type: "room_closed", roomId, closedAt: snapshot.closedAt });
+    setTimeout(() => c.close(), 1500);
+  });
+  delete rooms[String(roomId)];
 
-/**
- * POST /participacao
- * Registra ou incrementa participação de um usuário.
- * Body: { roomId, userId, nome, programa, tipo? }
- * Retorna ranking completo da sala.
- */
-app.post("/participacao", (req, res) => {
-  const { roomId, userId, nome, programa, tipo } = req.body || {};
-  if (!roomId || !userId || !programa)
-    return res.status(400).json({ ok: false, error: "dados incompletos" });
-
-  const room = getRoom(String(roomId));
-  if (!room.participacao) room.participacao = {};
-
-  const key = String(userId);
-  if (!room.participacao[key]) {
-    room.participacao[key] = { tgId: key, nome: String(nome || "Anon"), programa: String(programa), tipo: tipo || "", mensagens: 0 };
+  // Persiste na planilha via GAS (fire-and-forget)
+  if (GAS_ARCHIVE_URL) {
+    const payload = {
+      acao:         "tv_archive_save",
+      roomId:       String(roomId),
+      programa:     snapshot.meta.programa || roomId,
+      tipo:         snapshot.meta.tipo || "",
+      data:         snapshot.meta.data || "",
+      horario:      snapshot.meta.horario || "",
+      capaUrl:      snapshot.meta.capaUrl || "",
+      closedAt:     snapshot.closedAt,
+      totalMsgs:    snapshot.messages.length,
+      totalUsers:   Object.keys(snapshot.participacao).length,
+      messagesJson: JSON.stringify(snapshot.messages),
+      rankingJson:  JSON.stringify(ranking(snapshot)),
+    };
+    fetch(GAS_ARCHIVE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(e => console.error("[archive] GAS error:", e.message));
   }
-  room.participacao[key].mensagens += 1;
-  room.participacao[key].nome = String(nome || room.participacao[key].nome);
 
-  // recalcula porcentagens
-  const items = Object.values(room.participacao);
-  const total = items.reduce((s, i) => s + i.mensagens, 0);
-  items.forEach((i) => { i.porcentagem = total > 0 ? Math.round((i.mensagens / total) * 100) + "%" : "0%"; });
-
-  const ranking = items.sort((a, b) => b.mensagens - a.mensagens);
-  res.json({ ok: true, ranking });
+  res.json({ ok: true, snapshot });
 });
 
-/**
- * GET /participacao/:roomId
- * Retorna ranking atual da sala.
- */
+// ─── Arquivo em RAM (lista) ───────────────────────────────────────────────────
+app.get("/archive", (_req, res) => {
+  const list = Object.entries(archive).map(([roomId, ar]) => ({
+    roomId, programa: ar.meta.programa || roomId, tipo: ar.meta.tipo || "",
+    data: ar.meta.data || "", horario: ar.meta.horario || "", capaUrl: ar.meta.capaUrl || "",
+    closedAt: ar.closedAt, totalMsgs: ar.messages.length,
+    totalUsers: Object.keys(ar.participacao || {}).length,
+  })).sort((a, b) => new Date(b.closedAt) - new Date(a.closedAt));
+  res.json({ ok: true, archive: list });
+});
+
+app.get("/archive/:roomId", (req, res) => {
+  const ar = archive[String(req.params.roomId)];
+  if (!ar) return res.status(404).json({ ok: false, error: "Arquivo não encontrado" });
+  res.json({ ok: true, roomId: req.params.roomId, ...ar, ranking: ranking(ar) });
+});
+
+// ─── Participação ─────────────────────────────────────────────────────────────
 app.get("/participacao/:roomId", (req, res) => {
-  const roomId = String(req.params.roomId || "").trim();
-  const room = rooms[roomId];
-  if (!room || !room.participacao) return res.json({ ok: true, ranking: [] });
-  const items = Object.values(room.participacao).sort((a, b) => b.mensagens - a.mensagens);
-  res.json({ ok: true, ranking: items });
+  const id   = String(req.params.roomId || "").trim();
+  const room = rooms[id] || archive[id];
+  if (!room) return res.json({ ok: true, ranking: [] });
+  res.json({ ok: true, ranking: ranking(room) });
 });
 
-/**
- * GET /export/:roomId?clear=true
- * Exporta histórico (Apps Script chama no fim da transmissão).
- */
-app.get("/export/:roomId", (req, res) => {
-  const roomId = String(req.params.roomId || "");
-  const room = rooms[roomId];
-  const messages = room ? room.messages : [];
-  const participacao = room ? (room.participacao ? Object.values(room.participacao) : []) : [];
-  if (String(req.query.clear) === "true") delete rooms[roomId];
-  res.json({ roomId, messages, participacao, cleared: String(req.query.clear) === "true" });
-});
-
-// ─── WebSocket (opcional — melhora a experiência mas não é obrigatório) ───────
+// ─── WebSocket ────────────────────────────────────────────────────────────────
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss    = new WebSocket.Server({ server, path: "/ws" });
 
-wss.on("connection", (ws) => {
-  ws.on("message", (data) => {
-    let msg;
-    try { msg = JSON.parse(data.toString()); } catch { return; }
+wss.on("connection", (ws, req) => {
+  const url    = new URL(req.url, "http://x");
+  const roomId = url.searchParams.get("roomId") || "";
+  const userId = url.searchParams.get("userId") || "u_" + genId();
+  const nome   = decodeURIComponent(url.searchParams.get("nome") || "Anon");
 
-    if (msg.type === "join") {
-      const roomId = String(msg.roomId || "").trim();
-      const userId = String(msg.userId || "").trim();
-      const nome   = String(msg.nome   || "Anon").trim();
-      if (!roomId || !userId) return wsSend(ws, { type: "error", message: "roomId e userId obrigatórios" });
+  if (!roomId) { ws.close(1008, "roomId obrigatório"); return; }
 
-      const room = getRoom(roomId);
-      ws.roomId = roomId;
-      ws.userId = userId;
-      ws.nome   = nome;
-      room.clients.add(ws);
+  // Sala já arquivada → manda histórico e fecha
+  if (archive[roomId]) {
+    wsSend(ws, { type: "history", messages: archive[roomId].messages.slice(-200),
+      archived: true, closedAt: archive[roomId].closedAt });
+    ws.close(); return;
+  }
 
-      const history = room.messages;
-      const recent = history.length > 200 ? history.slice(-200) : history;
-      wsSend(ws, { type: "history", messages: recent });
-      return;
-    }
+  const room = getRoom(roomId);
+  ws.roomId  = roomId;
+  ws.userId  = userId;
+  ws.nome    = nome;
+  room.clients.add(ws);
+
+  // Histórico imediato
+  wsSend(ws, { type: "history",
+    messages: room.messages.length > 200 ? room.messages.slice(-200) : room.messages,
+    archived: false });
+  broadcastOnline(room);
+
+  // Keepalive ping a cada 25s
+  const pingInterval = setInterval(() => wsSend(ws, { type: "ping" }), 25000);
+
+  ws.on("message", raw => {
+    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+    if (msg.type === "pong") return;
 
     if (msg.type === "message") {
-      const roomId = String(msg.roomId || ws.roomId || "").trim();
-      const userId = String(msg.userId || ws.userId || "").trim();
-      const nome   = String(msg.nome   || ws.nome   || "Anon").trim();
-      const texto  = String(msg.texto  || "").trim();
+      const texto  = String(msg.texto || "").trim().slice(0, 500);
       const gifUrl = msg.gifUrl || "";
-      if (!roomId || !userId || (!texto && !gifUrl))
-        return wsSend(ws, { type: "error", message: "dados incompletos" });
+      if (!texto && !gifUrl) return;
+      if (archive[ws.roomId]) { wsSend(ws, { type: "error", message: "Transmissão encerrada." }); return; }
 
-      const chatMsg = {
-        id: genId(), tgId: userId, nome,
-        texto, tipo: msg.tipo || "texto", gifUrl,
-        data: new Date().toISOString(),
-      };
+      const chatMsg = { id: genId(), tgId: ws.userId, nome: ws.nome,
+        texto, tipo: msg.tipo || "texto", gifUrl, data: new Date().toISOString() };
 
-      const room = pushMessage(roomId, chatMsg);
+      const r = pushMsg(ws.roomId, chatMsg);
+      addParticipacao(r, ws.userId, ws.nome, ws.roomId);
 
-      // registra participação automaticamente
-      if (!room.participacao) room.participacao = {};
-      if (!room.participacao[userId]) room.participacao[userId] = { tgId: userId, nome, programa: roomId, tipo: "", mensagens: 0 };
-      room.participacao[userId].mensagens += 1;
-      const items = Object.values(room.participacao);
-      const total = items.reduce((s, i) => s + i.mensagens, 0);
-      items.forEach((i) => { i.porcentagem = Math.round((i.mensagens / total) * 100) + "%"; });
-
-      // broadcast para OUTROS clientes WS
-      broadcast(room, { type: "message", message: chatMsg }, ws);
-      // ACK para o remetente com id real
-      wsSend(ws, { type: "message_ack", message: chatMsg });
-      return;
+      wsSend(ws, { type: "message", message: chatMsg, ack: true });
+      broadcastRoom(r, { type: "message", message: chatMsg }, ws);
     }
   });
 
   ws.on("close", () => {
+    clearInterval(pingInterval);
+    if (ws.roomId && rooms[ws.roomId]) {
+      rooms[ws.roomId].clients.delete(ws);
+      broadcastOnline(rooms[ws.roomId]);
+    }
+  });
+  ws.on("error", () => {
+    clearInterval(pingInterval);
     if (ws.roomId && rooms[ws.roomId]) rooms[ws.roomId].clients.delete(ws);
   });
 });
 
-server.listen(PORT, () => console.log("Chat backend rodando na porta", PORT));
+server.listen(PORT, () => console.log("✅ Empire TV Chat v3 na porta", PORT));
